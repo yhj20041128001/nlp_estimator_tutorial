@@ -1,0 +1,37 @@
+# ============================================================
+# MySQL / TiDB 数据库账号安全监控配置
+# ============================================================
+
+monitor:
+  poll_interval: 30
+  log_file: account_monitor.log
+  state_file: account_monitor_state.json
+  high_risk_users:
+    - dba_root
+    - root
+  dormant_thresholds_days:
+    - 1
+    - 7
+    - 30
+
+telegram:
+  enabled: true
+  token: "6545738700:AAHcGPTlLwhMGI6R_4IS9rSc5guKR-rfW2k"
+  chat_id: "-1002393660208"
+
+proxy:
+  enabled: false
+  http: "http://10.108.247.221:3128"
+  https: "http://10.108.247.221:3128"
+
+databases:
+
+  - note: "tk-shayy测试环境"
+    tenant: "直播部门"
+    dbProject: "直播"
+    dbType: "mysql mgr集群"
+    hostname: "hk-cynosdbmysql-grp-ranc4tst.sql.tencentcdb.com"
+    host: "172.16.10.4"
+    port: 3306
+    username: "dba_monitor_alert"
+    password: "nBEjWPIf3pUHIUta4z8nGY"
