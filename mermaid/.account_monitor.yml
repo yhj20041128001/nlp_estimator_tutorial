@@ -16,22 +16,22 @@ monitor:
 
 telegram:
   enabled: true
-  token: "6545738700:AAHcGPTlLwhMGI6R_4IS9rSc5guKR-rfW2k"
-  chat_id: "-1002393660208"
+  token: "xxxx"
+  chat_id: "-xxxx"
 
 proxy:
   enabled: false
-  http: "http://10.108.247.221:3128"
-  https: "http://10.108.247.221:3128"
+  http: "http:/xxxx:xxx"
+  https: "http://xxxx:xxx"
 
 databases:
 
-  - note: "tk-shayy测试环境"
-    tenant: "直播部门"
-    dbProject: "直播"
-    dbType: "mysql mgr集群"
-    hostname: "hk-cynosdbmysql-grp-ranc4tst.sql.tencentcdb.com"
-    host: "172.16.10.4"
+  - note: "xxxxx测试环境"
+    tenant: "xxx部门"
+    dbProject: "xxx"
+    dbType: "mysql xxxx"
+    hostname: "xxxxxx"
+    host: "xxxxxxx"
     port: 3306
-    username: "dba_monitor_alert"
-    password: "nBEjWPIf3pUHIUta4z8nGY"
+    username: "dba_monitor_xxxx"
+    password: "xxxxxxxx"
