@@ -34,8 +34,8 @@ telegram:
 # 代理配置(按需启用)
 proxy:
   enabled: false
-  http: "http://10.108.247.221:3128"
-  https: "http://10.108.247.221:3128"
+  http: "http://xx.xx.xx.xx:xxxx"
+  https: "http://xx.xx.xx.xx:xxxx"
 
 # ============================================================
 # 数据库节点列表
