@@ -5,13 +5,67 @@ MySQL / TiDB 数据库账号安全监控脚本
 
 监控功能：
   F1 - 新账号创建告警（轮询 mysql.user 对比）
-  F2 - 高危账号登录告警（dba_root / root 出现在 PROCESSLIST）
+  F2 - 高危账号登录告警（dba_root / root 出现在 PROCESSLIST，连接中不重复；断开后重新登录再次告警）
   F3 - 休眠账号激活告警（账号距上次活跃超过阈值后再次出现）
   F4 - 账号权限变更告警（mysql.user 权限字段发生变化）
 
 配置文件：.account_monitor.yml（与脚本同目录）
-状态文件：account_monitor_state.json（与脚本同目录，自动生成）
+运行状态：持久化到中央存储库 account_monitor_state 表（自动创建）
 Python 版本：3.6+
+
+================================================================================
+中央存储库初始化 SQL（在存储节点手动执行一次，建库/建表/建用户/授权）
+================================================================================
+
+-- 1. 创建存储库
+CREATE DATABASE IF NOT EXISTS monitor_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+-- 2. 创建告警事件表
+CREATE TABLE IF NOT EXISTS `account_monitor_events` (
+  `id`          BIGINT NOT NULL AUTO_INCREMENT,
+  `node_key`    VARCHAR(100) NOT NULL COMMENT '被监控节点 host:port',
+  `note`        VARCHAR(200) DEFAULT NULL COMMENT '节点备注名',
+  `tenant`      VARCHAR(200) DEFAULT NULL COMMENT '部门',
+  `db_project`  VARCHAR(200) DEFAULT NULL COMMENT '项目',
+  `hostname`    VARCHAR(200) DEFAULT NULL COMMENT '主机名',
+  `db_type`     VARCHAR(50)  DEFAULT NULL COMMENT '数据库类型',
+  `alert_type`  VARCHAR(50)  NOT NULL     COMMENT 'new_account/high_risk_login/dormant_login/priv_change',
+  `alert_user`  VARCHAR(200) DEFAULT NULL COMMENT '相关账号',
+  `alert_host`  VARCHAR(200) DEFAULT NULL COMMENT '账号Host或来源IP',
+  `detail`      TEXT         DEFAULT NULL COMMENT '告警详情JSON',
+  `created_at`  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='数据库账号监控告警事件';
+
+-- 3. 创建运行状态表
+CREATE TABLE IF NOT EXISTS `account_monitor_state` (
+  `id`          BIGINT NOT NULL AUTO_INCREMENT,
+  `node_key`    VARCHAR(100) NOT NULL COMMENT '被监控节点 host:port',
+  `state_type`  VARCHAR(50)  NOT NULL COMMENT 'user_snapshot / last_active / high_risk_connected',
+  `user_key`    VARCHAR(200) NOT NULL COMMENT 'user@host 或 user',
+  `state_value` VARCHAR(500) NOT NULL COMMENT 'priv_hash 或 ISO时间戳 或 连接标记',
+  `updated_at`  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_state` (`node_key`, `state_type`, `user_key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='账号监控运行状态';
+
+-- 4. 创建存储写入账号（dba_monitor_write：向存储库写入告警事件和运行状态）
+CREATE USER 'dba_monitor_write'@'%' IDENTIFIED BY 'your_password';
+GRANT CREATE, INSERT, DELETE ON monitor_db.* TO 'dba_monitor_write'@'%';
+FLUSH PRIVILEGES;
+-- 如账号已存在，仅补授 DELETE 权限：
+-- GRANT DELETE ON monitor_db.* TO 'dba_monitor_write'@'%';
+-- FLUSH PRIVILEGES;
+
+-- 5. 创建监控查询账号（dba_monitor_alert：在每个被监控实例上执行）
+--    在每个被监控的 MySQL / TiDB 实例上分别执行：
+CREATE USER 'dba_monitor_alert'@'%' IDENTIFIED BY 'your_password';
+GRANT SELECT ON mysql.user TO 'dba_monitor_alert'@'%';
+GRANT SELECT ON information_schema.* TO 'dba_monitor_alert'@'%';
+GRANT PROCESS ON *.* TO 'dba_monitor_alert'@'%';
+FLUSH PRIVILEGES;
+
+================================================================================
 """
 
 import hashlib
@@ -89,7 +143,7 @@ def get_proxies(config: dict):
 
 
 # ===========================================================================
-# T2 — 状态层（StateStore，JSON 持久化）
+# T2 — 状态层（StateStore，持久化到中央 MySQL 存储库）
 # ===========================================================================
 
 class StateStore:
@@ -178,6 +232,15 @@ class StateStore:
         self._data.setdefault(node_key, {}).setdefault("last_active", {})
         self._data[node_key]["last_active"][user_key] = ts.isoformat()
 
+    # --- high_risk_connected（F2 去重：记录上一轮已连接的高危账号，每轮覆盖更新）
+    # 连接中不重复告警；断开后再次登录视为新事件，重新告警。
+
+    def get_high_risk_connected(self, node_key: str) -> set:
+        return set(self._data.get(node_key, {}).get("high_risk_connected", {}).keys())
+
+    def set_high_risk_connected(self, node_key: str, users: set):
+        self._data.setdefault(node_key, {})["high_risk_connected"] = {u: "1" for u in users}
+
 
 # ===========================================================================
 # T3 — 数据库查询层
@@ -212,13 +275,14 @@ def fetch_users(conn) -> list:
 
 def fetch_processlist(conn) -> list:
     """
-    查询 information_schema.PROCESSLIST，过滤 Sleep 连接。
-    返回 ID / USER / HOST / DB / TIME / COMMAND 字典列表。
+    查询 information_schema.PROCESSLIST，返回所有连接（含 Sleep）。
+    Sleep 连接也需要纳入监控：
+      - F2：root 连接后空闲（Sleep）也属于高危登录，不应漏检
+      - F3：持续空闲的连接需持续更新 last_seen，防止误报"休眠激活"
     """
     sql = """
         SELECT ID, USER, HOST, DB, TIME, COMMAND
         FROM information_schema.PROCESSLIST
-        WHERE COMMAND != 'Sleep'
     """
     cursor = conn.cursor(dictionary=True)
     try:
@@ -311,25 +375,43 @@ def check_priv_changes(current_snapshot: dict, rows_map: dict, known_snapshot: d
 # T5 — 检测层：F2 高危账号登录 + F3 休眠账号激活
 # ===========================================================================
 
-def check_high_risk_logins(conn, config: dict, logger) -> list:
+def check_high_risk_logins(conn, node_key: str, state: StateStore, config: dict, logger) -> list:
     """
     F2：检测高危账号（dba_root / root 等）出现在 PROCESSLIST。
-    无状态，每轮均检测并返回。
+    对比上一轮已连接集合，只对【新出现】的连接告警：
+    - 连接持续中：不重复告警
+    - 断开后重新登录：视为新事件，再次告警
     """
     high_risk = set(config.get("monitor", {}).get("high_risk_users", []))
     if not high_risk:
         return []
 
     processes = fetch_processlist(conn)
-    alerts = []
+    current_connected = {row["USER"] for row in processes if row["USER"] in high_risk}
+    prev_connected = state.get_high_risk_connected(node_key)
+
+    # 每轮覆盖更新（断连的账号自动移除，重连时重新进入 new_users）
+    state.set_high_risk_connected(node_key, current_connected)
+
+    new_users = current_connected - prev_connected
+    if not new_users:
+        return []
+
+    # 为每个新出现的高危账号取第一条 PROCESSLIST 记录作为告警详情
+    process_map = {}
     for row in processes:
-        if row["USER"] in high_risk:
-            logger.warning("[F2] 高危账号登录: user=%s host=%s", row["USER"], row["HOST"])
-            alerts.append({
-                "user": row["USER"],
-                "client_host": extract_client_ip(row["HOST"] or ""),
-                "db": row["DB"] or "N/A",
-            })
+        if row["USER"] in new_users and row["USER"] not in process_map:
+            process_map[row["USER"]] = row
+
+    alerts = []
+    for user in sorted(new_users):
+        row = process_map.get(user, {})
+        logger.warning("[F2] 高危账号登录: user=%s host=%s", user, row.get("HOST", ""))
+        alerts.append({
+            "user": user,
+            "client_host": extract_client_ip(row.get("HOST") or ""),
+            "db": row.get("DB") or "N/A",
+        })
     return alerts
 
 
@@ -502,9 +584,9 @@ _CREATE_STATE_TABLE_SQL_TPL = """
 CREATE TABLE IF NOT EXISTS `{table}` (
   `id`          BIGINT NOT NULL AUTO_INCREMENT,
   `node_key`    VARCHAR(100) NOT NULL COMMENT '被监控节点 host:port',
-  `state_type`  VARCHAR(50)  NOT NULL COMMENT 'user_snapshot / last_active',
+  `state_type`  VARCHAR(50)  NOT NULL COMMENT 'user_snapshot / last_active / high_risk_connected',
   `user_key`    VARCHAR(200) NOT NULL COMMENT 'user@host 或 user',
-  `state_value` VARCHAR(500) NOT NULL COMMENT 'priv_hash 或 ISO时间戳',
+  `state_value` VARCHAR(500) NOT NULL COMMENT 'priv_hash 或 ISO时间戳 或 连接标记',
   `updated_at`  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_state` (`node_key`, `state_type`, `user_key`)
@@ -636,7 +718,7 @@ def process_node(config: dict, db_info: dict, state: StateStore, logger):
         # 两项检测完成后统一更新快照（保证 F1/F4 都读到同一份旧快照）
         state.set_user_snapshot(node_key, current_snapshot)
 
-        high_risk_alerts = check_high_risk_logins(conn, config, logger)
+        high_risk_alerts = check_high_risk_logins(conn, node_key, state, config, logger)
         dormant_alerts = check_dormant_logins(conn, node_key, state, config, logger)
 
         # 推送 + 入库 F1 告警
@@ -686,8 +768,6 @@ def main():
     log_file = monitor_cfg.get("log_file", "account_monitor.log")
     logger = setup_logging(log_file)
 
-    state = StateStore(config)
-
     poll_interval = monitor_cfg.get("poll_interval", 30)
     databases = config.get("databases", [])
     if not databases:
@@ -712,8 +792,9 @@ def main():
             db.get("note", ""), db["host"], db["port"], db.get("dbType", "mysql"),
         )
 
-    # 初始化告警事件存储表（在所有日志输出之后执行）
+    # 先建表，再加载状态（避免首次运行时状态表不存在导致 _load() 报错）
     init_storage_table(config, logger)
+    state = StateStore(config)
 
     print("账号安全监控守护进程已启动，按 Ctrl+C 停止。")
 
