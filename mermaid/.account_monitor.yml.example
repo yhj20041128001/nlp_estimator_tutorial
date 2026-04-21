@@ -1,3 +1,4 @@
+
 # ============================================================
 # MySQL / TiDB 数据库账号安全监控配置
 # ============================================================
@@ -36,10 +37,13 @@ proxy:
   https: "http://10.xx.xx.xx:xx"
 
 # 告警事件 + 运行状态中央存储库（两张表由脚本启动时自动创建，数据库需提前手动创建）
-# 建库及授权语句（在存储节点执行一次）：
+# 完整建库/建表/建用户/授权语句见脚本头部注释，以下为最小化摘要：
 #   CREATE DATABASE IF NOT EXISTS monitor_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 #   CREATE USER 'dba_monitor_write'@'%' IDENTIFIED BY 'your_password';
 #   GRANT CREATE, INSERT, DELETE ON monitor_db.* TO 'dba_monitor_write'@'%';
+#   FLUSH PRIVILEGES;
+# 如账号已存在，仅补授 DELETE 权限：
+#   GRANT DELETE ON monitor_db.* TO 'dba_monitor_write'@'%';
 #   FLUSH PRIVILEGES;
 storage_db:
   enabled: true
