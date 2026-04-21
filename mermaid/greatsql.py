@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 # 修正了几个bug，20190823 by kisen
 # updated at 2020/03/10 by nicole
@@ -31,6 +32,26 @@
 #     check_mysql / create_mysql_monitor / install_rpl_semi_sync 均已修正
 # 14. [Bug修复] cfg_mysql_privileges 错误信息打印 int 退出码而非描述字符串：
 #     改为 "exit code: %d" 格式，可读性更好
+#
+# [Rocky Linux 9.6 适配]
+# 15. yum → dnf：Rocky Linux 9 默认包管理器为 dnf
+# 16. lsof 检测：/usr/sbin/lsof → which lsof（路径在 Rocky 9 已移至 /usr/bin）
+# 17. libaio 检测：/lib64/libaio.so.1 → ldconfig -p | grep libaio（路径变更且更通用）
+# 18. 服务管理：init.d + chkconfig → systemd service 文件 + systemctl
+#     - 不再复制 mysql 启动脚本到 /etc/init.d/
+#     - 改为写入 /etc/systemd/system/mysql{port}.service
+#     - chkconfig add/on → systemctl daemon-reload / enable
+#     - sys_run_file start → systemctl start
+# 19. chown mysql.mysql → chown mysql:mysql（Rocky 9 推荐冒号写法）
+# 20. [Bug修复] 密码修改命令中 /usr/sbin/lsof 仍硬编码，Rocky 9 路径已变更：
+#     改为直接使用 lsof（依赖 PATH，与第16条检测一致）
+# 21. [Bug修复] GRANT ... IDENTIFIED BY 在 MySQL 8.0 已废除，执行会报语法错误：
+#     改为先 CREATE USER IF NOT EXISTS，再单独 GRANT
+# 22. [Bug修复] 半同步插件名在 MySQL 8.0.26+ / GreatSQL 8.0.32 已更名：
+#     semisync_master.so / rpl_semi_sync_master → semisync_source.so / rpl_semi_sync_source
+#     semisync_slave.so  / rpl_semi_sync_slave  → semisync_replica.so / rpl_semi_sync_replica
+# 23. [Bug修复] my.cnf 复制失败后脚本继续执行，导致 sed 操作空文件：
+#     cp 失败时立即打印错误并退出
 
 import sys
 import getopt
@@ -324,10 +345,11 @@ def CheckReplaceFile(configure_dic):
     print(INFO % create_file_start_message)
     print(LINE)
     cp_file = subprocess.getstatusoutput("cp -fr %s  %s" % (local_file, data_file_path))
-    if int(cp_file[0]) == 0:
-        pass
-    else:
-        print(cp_file[1])
+    if int(cp_file[0]) != 0:
+        print(LINE_ERROR)
+        print(ERROR % ("[Error]: Failed to copy my.cnf: %s" % cp_file[1]))
+        print(LINE_ERROR)
+        sys.exit()
 
     mysql_file = os.path.join(data_file_path, local_file)
     for k, v in configure_dic.items():
@@ -359,11 +381,10 @@ def InstallMysql(install_cfg, filename):
     mysql_src_tar = filename
     mysql_src_name = mysql_src_tar.replace(".tar", "").strip()
     print(mysql_src_tar, mysql_src_name)
-    mysql_run_script = 'mysql'
     mysql_safe_file = '%s/bin/mysqld_safe' % install_cfg['--base-prefix']
     mysql_conf_file = os.path.join(data_file_path, mysql_conf_name)
-    mysql_run_file = os.path.join(data_file_path, mysql_run_script)
-    sys_run_file = "/etc/init.d/mysql%s" % install_cfg['--instance-ports']
+    sys_service_name = "mysql%s" % install_cfg['--instance-ports']
+    sys_service_file = "/etc/systemd/system/%s.service" % sys_service_name
     mysql_sock = "%s/mysql%s/mysql%s.sock" % (install_cfg['--data-prefix'], install_cfg['--instance-ports'], install_cfg['--instance-ports'])
 
     if os.path.exists(install_cfg['--base-prefix']) and os.path.exists(os.path.join(install_dir, mysql_src_name)):
@@ -380,10 +401,8 @@ def InstallMysql(install_cfg, filename):
     print(INFO % create_environment_start_message)
     print(LINE)
 
-    if os.path.exists('/usr/sbin/lsof'):
-        pass
-    else:
-        lsof_install = subprocess.getstatusoutput("yum install lsof -y")
+    if subprocess.getstatusoutput("which lsof")[0] != 0:
+        lsof_install = subprocess.getstatusoutput("dnf install lsof -y")
         if int(lsof_install[0]) != 0:
             msg = "[Error]: Failed To Install Lsof"
             print(LINE_ERROR)
@@ -394,7 +413,7 @@ def InstallMysql(install_cfg, filename):
     if os.path.exists('/usr/bin/perl'):
         pass
     else:
-        perl_install = subprocess.getstatusoutput("yum install perl -y")
+        perl_install = subprocess.getstatusoutput("dnf install perl -y")
         if int(perl_install[0]) != 0:
             msg = "[Error]: Failed To Install Perl"
             print(LINE_ERROR)
@@ -402,10 +421,8 @@ def InstallMysql(install_cfg, filename):
             print(LINE_ERROR)
             sys.exit()
 
-    if os.path.exists('/lib64/libaio.so.1'):
-        pass
-    else:
-        libaio_install = subprocess.getstatusoutput("yum install libaio-devel libaio numactl -y")
+    if subprocess.getstatusoutput("ldconfig -p | grep libaio")[0] != 0:
+        libaio_install = subprocess.getstatusoutput("dnf install libaio-devel libaio numactl -y")
         if int(libaio_install[0]) != 0:
             msg = "[Error]: Failed To Install Libaio"
             print(LINE_ERROR)
@@ -424,21 +441,37 @@ def InstallMysql(install_cfg, filename):
     for log in log_dir:
         subprocess.getstatusoutput("mkdir -p %s/%s" % (log_file_path, log))
 
-    subprocess.getstatusoutput("cp -fr %s %s" % (mysql_run_script, data_file_path))
-    subprocess.getstatusoutput("chown -R mysql.mysql %s" % data_file_path)
-    subprocess.getstatusoutput("chown -R mysql.mysql %s" % log_file_path)
+    subprocess.getstatusoutput("chown -R mysql:mysql %s" % data_file_path)
+    subprocess.getstatusoutput("chown -R mysql:mysql %s" % log_file_path)
 
-    subprocess.getstatusoutput("sed -i 's#{MYCNF-DIR}#'%s'#g' %s" % (mysql_conf_file, mysql_run_file))
-    subprocess.getstatusoutput("sed -i 's#{BIN-DIR}#'%s/bin'#g' %s" % (install_cfg['--base-prefix'], mysql_run_file))
-    subprocess.getstatusoutput(
-        "sed -i 's#{PID-DIR}#'%s/mysql%s.pid'#g' %s" % (log_file_path, install_cfg['--instance-ports'], mysql_run_file))
-    subprocess.getstatusoutput("cp -fr %s %s" % (mysql_run_file, sys_run_file))
-
-    subprocess.getstatusoutput("chmod 700 %s" % sys_run_file)
-
-    subprocess.getstatusoutput("/sbin/chkconfig add mysql%s" % install_cfg['--instance-ports'])
-    subprocess.getstatusoutput("/sbin/chkconfig mysql%s on" % install_cfg['--instance-ports'])
-    subprocess.getstatusoutput("find %s -name mysql -exec chmod 700 {} \\;" % data_file_path)
+    # 创建 systemd service 文件（Rocky Linux 9 使用 systemd，不再使用 init.d + chkconfig）
+    pid_file = "%s/mysql%s.pid" % (log_file_path, install_cfg['--instance-ports'])
+    service_content = (
+        "[Unit]\n"
+        "Description=GreatSQL Server Port %s\n"
+        "After=network.target syslog.target\n\n"
+        "[Service]\n"
+        "Type=forking\n"
+        "User=mysql\n"
+        "Group=mysql\n"
+        "PIDFile=%s\n"
+        "ExecStart=%s/bin/mysqld_safe --defaults-file=%s --user=mysql --pid-file=%s\n"
+        "ExecStop=%s/bin/mysqladmin -u root -S %s shutdown\n"
+        "Restart=on-failure\n"
+        "RestartSec=5\n\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    ) % (
+        install_cfg['--instance-ports'],
+        pid_file,
+        install_cfg['--base-prefix'], mysql_conf_file, pid_file,
+        install_cfg['--base-prefix'], mysql_sock,
+    )
+    with open(sys_service_file, 'w') as f:
+        f.write(service_content)
+    subprocess.getstatusoutput("chmod 644 %s" % sys_service_file)
+    subprocess.getstatusoutput("systemctl daemon-reload")
+    subprocess.getstatusoutput("systemctl enable %s" % sys_service_name)
 
     mysql_value = subprocess.getstatusoutput("grep -w mysql%s /etc/profile | wc -l" % install_cfg['--instance-ports'])
     if int(mysql_value[1]) == 0:
@@ -476,9 +509,8 @@ def InstallMysql(install_cfg, filename):
     print(LINE)
     print(INFO % mysql_start_message)
     print(LINE)
-    print("the sys_run_file is %s" % sys_run_file)
-    mysql_start = subprocess.call([sys_run_file, 'start'])
-    print("start print mysql_start")
+    print("the service file is %s" % sys_service_file)
+    mysql_start = subprocess.call(["systemctl", "start", sys_service_name])
     if mysql_start > 0:
         print("MySQL failed to start on %s" % install_cfg['--instance-ports'])
         sys.exit()
@@ -495,7 +527,7 @@ def InstallMysql(install_cfg, filename):
     password_temp = subprocess.getstatusoutput(a)[1].strip()
     password = 'openssl rand -base64 20'
     rootpwd = subprocess.getoutput(password)
-    scommand = """/usr/sbin/lsof -i :%s &>/dev/null && %s/bin/mysql --connect-expired-password --socket=%s -u root -p"%s" -e "alter user 'root'@'localhost' identified by '%s';SET SQL_LOG_BIN=1;"
+    scommand = """lsof -i :%s &>/dev/null && %s/bin/mysql --connect-expired-password --socket=%s -u root -p"%s" -e "alter user 'root'@'localhost' identified by '%s';SET SQL_LOG_BIN=1;"
     """ % (install_cfg['--instance-ports'], install_cfg['--base-prefix'], mysql_sock, password_temp, rootpwd)
     print(scommand)
     cfg_mysql_privileges = subprocess.call(scommand, shell=True)
@@ -544,8 +576,9 @@ def InstallMysql(install_cfg, filename):
     print(INFO % create_user_start_message)
     print(LINE)
 
+    # MySQL 8.0 禁止在 GRANT 中使用 IDENTIFIED BY，需先建账号再授权
     subprocess.getstatusoutput(
-        '''%s/bin/mysql -uroot -p"%s" -S %s -Bse "GRANT PROCESS,REPLICATION CLIENT ON *.* TO 'monitoring'@'127.0.0.1' identified by '8e3d7855e5681ee463e28394c2bb33043e65dbb9';FLUSH PRIVILEGES;" ''' % (
+        '''%s/bin/mysql -uroot -p"%s" -S %s -Bse "CREATE USER IF NOT EXISTS 'monitoring'@'127.0.0.1' IDENTIFIED BY '8e3d7855e5681ee463e28394c2bb33043e65dbb9';GRANT PROCESS,REPLICATION CLIENT ON *.* TO 'monitoring'@'127.0.0.1';FLUSH PRIVILEGES;" ''' % (
             install_cfg['--base-prefix'], rootpwd, mysql_sock))
 
     create_user_finish_message = "Creating MySQL Monitoring User Finish..."
@@ -558,8 +591,9 @@ def InstallMysql(install_cfg, filename):
     print(INFO % install_rpl_start_message)
     print(LINE)
 
+    # GreatSQL 8.0.32-26 使用 MySQL 8.0.26+ 新插件名（source/replica 替代 master/slave）
     install_rpl_semi_sync = subprocess.getstatusoutput(
-        '''%s/bin/mysql -uroot -p"%s" -S %s -e "INSTALL PLUGIN rpl_semi_sync_master SONAME 'semisync_master.so';INSTALL PLUGIN rpl_semi_sync_slave SONAME 'semisync_slave.so';" ''' % (
+        '''%s/bin/mysql -uroot -p"%s" -S %s -e "INSTALL PLUGIN rpl_semi_sync_source SONAME 'semisync_source.so';INSTALL PLUGIN rpl_semi_sync_replica SONAME 'semisync_replica.so';" ''' % (
             install_cfg['--base-prefix'], rootpwd, mysql_sock))
     if int(install_rpl_semi_sync[0]) != 0:
         print(install_rpl_semi_sync[1])
